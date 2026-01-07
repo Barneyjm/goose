@@ -2,15 +2,27 @@ use chrono;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use url::Url;
 
 /// Default Azure AD resource for cognitive services (used by Azure OpenAI)
 pub const AZURE_COGNITIVE_SERVICES_RESOURCE: &str = "https://cognitiveservices.azure.com";
 
 /// Azure Instance Metadata Service endpoint for managed identity
 const IMDS_ENDPOINT: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
+
+/// Formats a resource string as a scope for Azure AD v2.0 endpoints.
+/// Azure AD v2.0 requires scopes to end with `/.default` for client credentials flow.
+fn format_scope(resource: &str) -> String {
+    if resource.ends_with("/.default") {
+        resource.to_string()
+    } else {
+        format!("{}/.default", resource)
+    }
+}
 
 /// Represents errors that can occur during Azure authentication.
 #[derive(Debug, thiserror::Error)]
@@ -223,6 +235,21 @@ impl std::fmt::Debug for AzureAuth {
 }
 
 impl AzureAuth {
+    /// Creates a new AzureAuth instance with the given credentials.
+    /// This is a private helper to avoid duplicating HTTP client initialization.
+    fn new_with_credentials(credentials: AzureCredentials) -> Result<Self, AuthError> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            credentials,
+            cached_token: Arc::new(RwLock::new(None)),
+            http_client,
+        })
+    }
+
     /// Creates a new Azure authentication handler.
     ///
     /// Initializes the authentication handler by:
@@ -237,17 +264,7 @@ impl AzureAuth {
             Some(key) => AzureCredentials::ApiKey(key),
             None => AzureCredentials::DefaultCredential,
         };
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
-
-        Ok(Self {
-            credentials,
-            cached_token: Arc::new(RwLock::new(None)),
-            http_client,
-        })
+        Self::new_with_credentials(credentials)
     }
 
     /// Creates a new Azure authentication handler with client secret credentials.
@@ -269,24 +286,13 @@ impl AzureAuth {
         client_secret: String,
         resource: Option<String>,
     ) -> Result<Self, AuthError> {
-        let credentials =
-            AzureCredentials::ClientSecret(ClientSecretCredential::new(
-                tenant_id,
-                client_id,
-                client_secret,
-                resource,
-            ));
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
-
-        Ok(Self {
-            credentials,
-            cached_token: Arc::new(RwLock::new(None)),
-            http_client,
-        })
+        let credentials = AzureCredentials::ClientSecret(ClientSecretCredential::new(
+            tenant_id,
+            client_id,
+            client_secret,
+            resource,
+        ));
+        Self::new_with_credentials(credentials)
     }
 
     /// Creates a new Azure authentication handler with client certificate credentials.
@@ -314,17 +320,7 @@ impl AzureAuth {
             certificate_pem,
             resource,
         ));
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
-
-        Ok(Self {
-            credentials,
-            cached_token: Arc::new(RwLock::new(None)),
-            http_client,
-        })
+        Self::new_with_credentials(credentials)
     }
 
     /// Creates a new Azure authentication handler with client certificate from file.
@@ -345,18 +341,7 @@ impl AzureAuth {
     ) -> Result<Self, AuthError> {
         let cred =
             ClientCertificateCredential::from_file(tenant_id, client_id, certificate_path, resource)?;
-        let credentials = AzureCredentials::ClientCertificate(cred);
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
-
-        Ok(Self {
-            credentials,
-            cached_token: Arc::new(RwLock::new(None)),
-            http_client,
-        })
+        Self::new_with_credentials(AzureCredentials::ClientCertificate(cred))
     }
 
     /// Creates a new Azure authentication handler for system-assigned managed identity.
@@ -372,17 +357,7 @@ impl AzureAuth {
     pub fn with_managed_identity(resource: Option<String>) -> Result<Self, AuthError> {
         let credentials =
             AzureCredentials::ManagedIdentity(ManagedIdentityCredential::system_assigned(resource));
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
-
-        Ok(Self {
-            credentials,
-            cached_token: Arc::new(RwLock::new(None)),
-            http_client,
-        })
+        Self::new_with_credentials(credentials)
     }
 
     /// Creates a new Azure authentication handler for user-assigned managed identity.
@@ -402,22 +377,47 @@ impl AzureAuth {
         let credentials = AzureCredentials::ManagedIdentity(
             ManagedIdentityCredential::user_assigned(client_id, resource),
         );
-
-        let http_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
-
-        Ok(Self {
-            credentials,
-            cached_token: Arc::new(RwLock::new(None)),
-            http_client,
-        })
+        Self::new_with_credentials(credentials)
     }
 
     /// Returns the type of credentials being used.
     pub fn credential_type(&self) -> &AzureCredentials {
         &self.credentials
+    }
+
+    /// Helper method that implements the double-checked locking pattern for token caching.
+    /// Accepts an async closure that fetches a new token when the cache is expired.
+    async fn get_or_refresh_token<F, Fut>(&self, fetch_token: F) -> Result<AuthToken, AuthError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(AuthToken, Instant), AuthError>>,
+    {
+        // Try read lock first for better concurrency
+        if let Some(cached) = self.cached_token.read().await.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Take write lock only if needed
+        let mut token_guard = self.cached_token.write().await;
+
+        // Double-check expiration after acquiring write lock
+        if let Some(cached) = token_guard.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Fetch new token using the provided closure
+        let (auth_token, expires_at) = fetch_token().await?;
+
+        *token_guard = Some(CachedToken {
+            token: auth_token.clone(),
+            expires_at,
+        });
+
+        Ok(auth_token)
     }
 
     /// Retrieves a valid authentication token.
@@ -458,63 +458,46 @@ impl AzureAuth {
     }
 
     async fn get_default_credential_token(&self) -> Result<AuthToken, AuthError> {
-        // Try read lock first for better concurrency
-        if let Some(cached) = self.cached_token.read().await.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
+        self.get_or_refresh_token(|| async {
+            // Get new token using Azure CLI credential
+            let output = tokio::process::Command::new("az")
+                .args([
+                    "account",
+                    "get-access-token",
+                    "--resource",
+                    "https://cognitiveservices.azure.com",
+                ])
+                .output()
+                .await
+                .map_err(|e| {
+                    AuthError::TokenExchange(format!("Failed to execute Azure CLI: {}", e))
+                })?;
+
+            if !output.status.success() {
+                return Err(AuthError::TokenExchange(
+                    String::from_utf8_lossy(&output.stderr).to_string(),
+                ));
             }
-        }
 
-        // Take write lock only if needed
-        let mut token_guard = self.cached_token.write().await;
+            let token_response: CliTokenResponse = serde_json::from_slice(&output.stdout)
+                .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
 
-        // Double-check expiration after acquiring write lock
-        if let Some(cached) = token_guard.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
-            }
-        }
+            let auth_token = AuthToken {
+                token_type: token_response.token_type,
+                token_value: token_response.access_token,
+            };
 
-        // Get new token using Azure CLI credential
-        let output = tokio::process::Command::new("az")
-            .args([
-                "account",
-                "get-access-token",
-                "--resource",
-                "https://cognitiveservices.azure.com",
-            ])
-            .output()
-            .await
-            .map_err(|e| AuthError::TokenExchange(format!("Failed to execute Azure CLI: {}", e)))?;
+            let expires_at = Instant::now()
+                + Duration::from_secs(
+                    token_response
+                        .expires_on
+                        .saturating_sub(chrono::Utc::now().timestamp() as u64)
+                        .saturating_sub(30),
+                );
 
-        if !output.status.success() {
-            return Err(AuthError::TokenExchange(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
-        }
-
-        let token_response: CliTokenResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
-
-        let auth_token = AuthToken {
-            token_type: token_response.token_type,
-            token_value: token_response.access_token,
-        };
-
-        let expires_at = Instant::now()
-            + Duration::from_secs(
-                token_response
-                    .expires_on
-                    .saturating_sub(chrono::Utc::now().timestamp() as u64)
-                    .saturating_sub(30),
-            );
-
-        *token_guard = Some(CachedToken {
-            token: auth_token.clone(),
-            expires_at,
-        });
-
-        Ok(auth_token)
+            Ok((auth_token, expires_at))
+        })
+        .await
     }
 
     /// Retrieves a token using client secret credentials via Azure AD OAuth2 endpoint.
@@ -522,83 +505,62 @@ impl AzureAuth {
         &self,
         cred: &ClientSecretCredential,
     ) -> Result<AuthToken, AuthError> {
-        // Try read lock first for better concurrency
-        if let Some(cached) = self.cached_token.read().await.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
-            }
-        }
+        let http_client = self.http_client.clone();
+        let tenant_id = cred.tenant_id.clone();
+        let client_id = cred.client_id.clone();
+        let client_secret = cred.client_secret.clone();
+        let scope = format_scope(&cred.resource);
 
-        // Take write lock only if needed
-        let mut token_guard = self.cached_token.write().await;
+        self.get_or_refresh_token(|| async move {
+            // Request new token from Azure AD OAuth2 endpoint
+            let token_url = format!(
+                "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+                tenant_id
+            );
 
-        // Double-check expiration after acquiring write lock
-        if let Some(cached) = token_guard.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
-            }
-        }
+            let params = [
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("scope", scope.as_str()),
+            ];
 
-        // Request new token from Azure AD OAuth2 endpoint
-        let token_url = format!(
-            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-            cred.tenant_id
-        );
-
-        // Build scope from resource (Azure AD v2.0 uses scopes with /.default suffix)
-        let scope = if cred.resource.ends_with("/.default") {
-            cred.resource.clone()
-        } else {
-            format!("{}/.default", cred.resource)
-        };
-
-        let params = [
-            ("grant_type", "client_credentials"),
-            ("client_id", &cred.client_id),
-            ("client_secret", &cred.client_secret),
-            ("scope", &scope),
-        ];
-
-        let response = self
-            .http_client
-            .post(&token_url)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| AuthError::TokenExchange(format!("Failed to request token: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response
-                .text()
+            let response = http_client
+                .post(&token_url)
+                .form(&params)
+                .send()
                 .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AuthError::TokenExchange(format!(
-                "Token request failed with status {}: {}",
-                status, error_body
-            )));
-        }
+                .map_err(|e| AuthError::TokenExchange(format!("Failed to request token: {}", e)))?;
 
-        let token_response: OAuth2TokenResponse = response
-            .json()
-            .await
-            .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
+                return Err(AuthError::TokenExchange(format!(
+                    "Token request failed with status {}: {}",
+                    status, error_body
+                )));
+            }
 
-        let auth_token = AuthToken {
-            token_type: token_response.token_type,
-            token_value: token_response.access_token,
-        };
+            let token_response: OAuth2TokenResponse = response
+                .json()
+                .await
+                .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
 
-        // Cache with 30 second buffer before expiry
-        let expires_at =
-            Instant::now() + Duration::from_secs(token_response.expires_in.saturating_sub(30));
+            let auth_token = AuthToken {
+                token_type: token_response.token_type,
+                token_value: token_response.access_token,
+            };
 
-        *token_guard = Some(CachedToken {
-            token: auth_token.clone(),
-            expires_at,
-        });
+            // Cache with 30 second buffer before expiry
+            let expires_at =
+                Instant::now() + Duration::from_secs(token_response.expires_in.saturating_sub(30));
 
-        Ok(auth_token)
+            Ok((auth_token, expires_at))
+        })
+        .await
     }
 
     /// Retrieves a token using client certificate credentials via Azure AD OAuth2 endpoint.
@@ -606,89 +568,64 @@ impl AzureAuth {
         &self,
         cred: &ClientCertificateCredential,
     ) -> Result<AuthToken, AuthError> {
-        // Try read lock first for better concurrency
-        if let Some(cached) = self.cached_token.read().await.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
-            }
-        }
-
-        // Take write lock only if needed
-        let mut token_guard = self.cached_token.write().await;
-
-        // Double-check expiration after acquiring write lock
-        if let Some(cached) = token_guard.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
-            }
-        }
-
-        // Create JWT assertion for client certificate auth
+        // Create JWT assertion for client certificate auth (done outside closure to avoid lifetime issues)
         let token_url = format!(
             "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
             cred.tenant_id
         );
-
         let assertion = self.create_certificate_assertion(cred, &token_url)?;
+        let scope = format_scope(&cred.resource);
+        let client_id = cred.client_id.clone();
+        let http_client = self.http_client.clone();
 
-        // Build scope from resource
-        let scope = if cred.resource.ends_with("/.default") {
-            cred.resource.clone()
-        } else {
-            format!("{}/.default", cred.resource)
-        };
+        self.get_or_refresh_token(|| async move {
+            let params = [
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id.as_str()),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", assertion.as_str()),
+                ("scope", scope.as_str()),
+            ];
 
-        let params = [
-            ("grant_type", "client_credentials"),
-            ("client_id", cred.client_id.as_str()),
-            (
-                "client_assertion_type",
-                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            ),
-            ("client_assertion", assertion.as_str()),
-            ("scope", scope.as_str()),
-        ];
-
-        let response = self
-            .http_client
-            .post(&token_url)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| AuthError::TokenExchange(format!("Failed to request token: {}", e)))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response
-                .text()
+            let response = http_client
+                .post(&token_url)
+                .form(&params)
+                .send()
                 .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AuthError::TokenExchange(format!(
-                "Token request failed with status {}: {}",
-                status, error_body
-            )));
-        }
+                .map_err(|e| AuthError::TokenExchange(format!("Failed to request token: {}", e)))?;
 
-        let token_response: OAuth2TokenResponse = response
-            .json()
-            .await
-            .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
+                return Err(AuthError::TokenExchange(format!(
+                    "Token request failed with status {}: {}",
+                    status, error_body
+                )));
+            }
 
-        let auth_token = AuthToken {
-            token_type: token_response.token_type,
-            token_value: token_response.access_token,
-        };
+            let token_response: OAuth2TokenResponse = response
+                .json()
+                .await
+                .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
 
-        // Cache with 30 second buffer before expiry
-        let expires_at =
-            Instant::now() + Duration::from_secs(token_response.expires_in.saturating_sub(30));
+            let auth_token = AuthToken {
+                token_type: token_response.token_type,
+                token_value: token_response.access_token,
+            };
 
-        *token_guard = Some(CachedToken {
-            token: auth_token.clone(),
-            expires_at,
-        });
+            // Cache with 30 second buffer before expiry
+            let expires_at =
+                Instant::now() + Duration::from_secs(token_response.expires_in.saturating_sub(30));
 
-        Ok(auth_token)
+            Ok((auth_token, expires_at))
+        })
+        .await
     }
 
     /// Creates a JWT assertion for client certificate authentication.
@@ -726,33 +663,23 @@ impl AzureAuth {
     }
 
     /// Extracts the SHA-256 thumbprint from a PEM certificate.
-    fn extract_certificate_thumbprint(&self, pem: &str) -> Result<String, AuthError> {
-        // Find the certificate section in the PEM
-        let cert_start = pem
-            .find("-----BEGIN CERTIFICATE-----")
+    fn extract_certificate_thumbprint(&self, pem_content: &str) -> Result<String, AuthError> {
+        // Use pem crate for robust certificate parsing
+        let pem_entries = pem::parse_many(pem_content)
+            .map_err(|e| AuthError::Credentials(format!("Failed to parse PEM content: {}", e)))?;
+
+        // Find the certificate entry
+        let cert_pem = pem_entries
+            .iter()
+            .find(|p| p.tag() == "CERTIFICATE")
             .ok_or_else(|| AuthError::Credentials("No certificate found in PEM".to_string()))?;
-        let cert_end = pem[cert_start..]
-            .find("-----END CERTIFICATE-----")
-            .ok_or_else(|| AuthError::Credentials("Invalid certificate in PEM".to_string()))?
-            + cert_start
-            + "-----END CERTIFICATE-----".len();
 
-        let cert_pem = &pem[cert_start..cert_end];
-
-        // Extract base64 content (remove headers and whitespace)
-        let base64_content: String = cert_pem
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect::<Vec<_>>()
-            .join("");
-
-        // Decode base64 to get DER
-        let der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_content)
-            .map_err(|e| AuthError::Credentials(format!("Failed to decode certificate: {}", e)))?;
+        // Get the DER-encoded certificate content
+        let der = cert_pem.contents();
 
         // Calculate SHA-256 hash
         let mut hasher = Sha256::new();
-        hasher.update(&der);
+        hasher.update(der);
         let hash = hasher.finalize();
 
         // Encode as base64url (without padding)
@@ -767,88 +694,75 @@ impl AzureAuth {
         &self,
         cred: &ManagedIdentityCredential,
     ) -> Result<AuthToken, AuthError> {
-        // Try read lock first for better concurrency
-        if let Some(cached) = self.cached_token.read().await.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
+        // Build IMDS request URL using url crate for proper encoding
+        let mut imds_url = Url::parse(IMDS_ENDPOINT)
+            .map_err(|e| AuthError::Credentials(format!("Invalid IMDS endpoint URL: {}", e)))?;
+
+        {
+            let mut query_pairs = imds_url.query_pairs_mut();
+            query_pairs.append_pair("api-version", "2018-02-01");
+            query_pairs.append_pair("resource", &cred.resource);
+
+            // Add client_id for user-assigned managed identity
+            if let Some(client_id) = &cred.client_id {
+                query_pairs.append_pair("client_id", client_id);
             }
         }
 
-        // Take write lock only if needed
-        let mut token_guard = self.cached_token.write().await;
+        let url_string = imds_url.to_string();
+        let http_client = self.http_client.clone();
 
-        // Double-check expiration after acquiring write lock
-        if let Some(cached) = token_guard.as_ref() {
-            if cached.expires_at > Instant::now() {
-                return Ok(cached.token.clone());
-            }
-        }
-
-        // Build IMDS request URL
-        let mut url = format!(
-            "{}?api-version=2018-02-01&resource={}",
-            IMDS_ENDPOINT, cred.resource
-        );
-
-        // Add client_id for user-assigned managed identity
-        if let Some(client_id) = &cred.client_id {
-            url = format!("{}&client_id={}", url, client_id);
-        }
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Metadata", "true")
-            .send()
-            .await
-            .map_err(|e| {
-                AuthError::TokenExchange(format!(
-                    "Failed to request token from IMDS (are you running in Azure?): {}",
-                    e
-                ))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response
-                .text()
+        self.get_or_refresh_token(|| async move {
+            let response = http_client
+                .get(&url_string)
+                .header("Metadata", "true")
+                .send()
                 .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(AuthError::TokenExchange(format!(
-                "IMDS token request failed with status {} (ensure managed identity is configured): {}",
-                status, error_body
-            )));
-        }
+                .map_err(|e| {
+                    AuthError::TokenExchange(format!(
+                        "Failed to request token from IMDS (are you running in Azure?): {}",
+                        e
+                    ))
+                })?;
 
-        let token_response: ImdsTokenResponse = response
-            .json()
-            .await
-            .map_err(|e| AuthError::TokenExchange(format!("Invalid IMDS token response: {}", e)))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown error".to_string());
+                return Err(AuthError::TokenExchange(format!(
+                    "IMDS token request failed with status {} (ensure managed identity is configured): {}",
+                    status, error_body
+                )));
+            }
 
-        let auth_token = AuthToken {
-            token_type: token_response.token_type,
-            token_value: token_response.access_token,
-        };
+            let token_response: ImdsTokenResponse = response
+                .json()
+                .await
+                .map_err(|e| AuthError::TokenExchange(format!("Invalid IMDS token response: {}", e)))?;
 
-        // Parse expires_on as Unix timestamp and calculate duration
-        let expires_on: u64 = token_response
-            .expires_on
-            .parse()
-            .map_err(|e| AuthError::TokenExchange(format!("Invalid expires_on value: {}", e)))?;
+            let auth_token = AuthToken {
+                token_type: token_response.token_type,
+                token_value: token_response.access_token,
+            };
 
-        let expires_at = Instant::now()
-            + Duration::from_secs(
-                expires_on
-                    .saturating_sub(chrono::Utc::now().timestamp() as u64)
-                    .saturating_sub(30),
-            );
+            // Parse expires_on as Unix timestamp and calculate duration
+            let expires_on: u64 = token_response
+                .expires_on
+                .parse()
+                .map_err(|e| AuthError::TokenExchange(format!("Invalid expires_on value: {}", e)))?;
 
-        *token_guard = Some(CachedToken {
-            token: auth_token.clone(),
-            expires_at,
-        });
+            let expires_at = Instant::now()
+                + Duration::from_secs(
+                    expires_on
+                        .saturating_sub(chrono::Utc::now().timestamp() as u64)
+                        .saturating_sub(30),
+                );
 
-        Ok(auth_token)
+            Ok((auth_token, expires_at))
+        })
+        .await
     }
 }
 
