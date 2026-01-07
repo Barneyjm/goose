@@ -61,7 +61,8 @@ impl AuthProvider for AzureAuthProvider {
             super::azureauth::AzureCredentials::ApiKey(_) => {
                 Ok(("api-key".to_string(), auth_token.token_value))
             }
-            super::azureauth::AzureCredentials::DefaultCredential => Ok((
+            super::azureauth::AzureCredentials::DefaultCredential
+            | super::azureauth::AzureCredentials::ClientSecret(_) => Ok((
                 "Authorization".to_string(),
                 format!("Bearer {}", auth_token.token_value),
             )),
