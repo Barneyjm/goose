@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::api_client::{ApiClient, AuthMethod, AuthProvider};
-use super::azureauth::{AuthError, AzureAuth};
+use super::azureauth::{map_auth_error, require_tenant_and_client_ids, AzureAuth};
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
@@ -107,90 +107,33 @@ impl AzureProvider {
         let auth = if use_managed_identity {
             // Use Managed Identity authentication
             let azure_auth = if let Some(id) = &client_id {
-                // User-assigned managed identity
                 AzureAuth::with_user_assigned_managed_identity(id.clone(), token_scope)
             } else {
-                // System-assigned managed identity
                 AzureAuth::with_managed_identity(token_scope)
             }
-            .map_err(|e| match e {
-                AuthError::Credentials(msg) => {
-                    anyhow::anyhow!("Managed identity credentials error: {}", msg)
-                }
-                AuthError::TokenExchange(msg) => {
-                    anyhow::anyhow!("Managed identity token exchange error: {}", msg)
-                }
-            })?;
+            .map_err(|e| map_auth_error(e, "Managed identity"))?;
             azure_auth
         } else if let Some(cert_path) = &certificate_path {
             // Use Client Certificate authentication from file
-            let (t_id, c_id) = match (&tenant_id, &client_id) {
-                (Some(t), Some(c)) => (t.clone(), c.clone()),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "When using certificate authentication, both AZURE_OPENAI_TENANT_ID \
-                         and AZURE_OPENAI_CLIENT_ID must be set."
-                    ));
-                }
-            };
-            AzureAuth::with_client_certificate_file(t_id, c_id, cert_path, token_scope).map_err(
-                |e| match e {
-                    AuthError::Credentials(msg) => {
-                        anyhow::anyhow!("Certificate credentials error: {}", msg)
-                    }
-                    AuthError::TokenExchange(msg) => {
-                        anyhow::anyhow!("Certificate token exchange error: {}", msg)
-                    }
-                },
-            )?
+            let (t_id, c_id) =
+                require_tenant_and_client_ids(&tenant_id, &client_id, "AZURE_OPENAI")?;
+            AzureAuth::with_client_certificate_file(t_id, c_id, cert_path, token_scope)
+                .map_err(|e| map_auth_error(e, "Certificate"))?
         } else if let Some(cert_pem) = &certificate {
             // Use Client Certificate authentication from PEM content
-            let (t_id, c_id) = match (&tenant_id, &client_id) {
-                (Some(t), Some(c)) => (t.clone(), c.clone()),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "When using certificate authentication, both AZURE_OPENAI_TENANT_ID \
-                         and AZURE_OPENAI_CLIENT_ID must be set."
-                    ));
-                }
-            };
-            AzureAuth::with_client_certificate(t_id, c_id, cert_pem.clone(), token_scope).map_err(
-                |e| match e {
-                    AuthError::Credentials(msg) => {
-                        anyhow::anyhow!("Certificate credentials error: {}", msg)
-                    }
-                    AuthError::TokenExchange(msg) => {
-                        anyhow::anyhow!("Certificate token exchange error: {}", msg)
-                    }
-                },
-            )?
+            let (t_id, c_id) =
+                require_tenant_and_client_ids(&tenant_id, &client_id, "AZURE_OPENAI")?;
+            AzureAuth::with_client_certificate(t_id, c_id, cert_pem.clone(), token_scope)
+                .map_err(|e| map_auth_error(e, "Certificate"))?
         } else if let Some(secret) = &client_secret {
             // Use Client Secret authentication
-            let (t_id, c_id) = match (&tenant_id, &client_id) {
-                (Some(t), Some(c)) => (t.clone(), c.clone()),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "When using client secret authentication, both AZURE_OPENAI_TENANT_ID \
-                         and AZURE_OPENAI_CLIENT_ID must be set."
-                    ));
-                }
-            };
-            AzureAuth::with_client_secret(t_id, c_id, secret.clone(), token_scope).map_err(
-                |e| match e {
-                    AuthError::Credentials(msg) => {
-                        anyhow::anyhow!("Client secret credentials error: {}", msg)
-                    }
-                    AuthError::TokenExchange(msg) => {
-                        anyhow::anyhow!("Client secret token exchange error: {}", msg)
-                    }
-                },
-            )?
+            let (t_id, c_id) =
+                require_tenant_and_client_ids(&tenant_id, &client_id, "AZURE_OPENAI")?;
+            AzureAuth::with_client_secret(t_id, c_id, secret.clone(), token_scope)
+                .map_err(|e| map_auth_error(e, "Client secret"))?
         } else {
             // Use API Key or Default Credential (Azure CLI)
-            AzureAuth::new(api_key).map_err(|e| match e {
-                AuthError::Credentials(msg) => anyhow::anyhow!("Credentials error: {}", msg),
-                AuthError::TokenExchange(msg) => anyhow::anyhow!("Token exchange error: {}", msg),
-            })?
+            AzureAuth::new(api_key).map_err(|e| map_auth_error(e, "Azure"))?
         };
 
         let auth_provider = AzureAuthProvider { auth };

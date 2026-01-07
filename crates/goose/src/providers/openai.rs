@@ -1,5 +1,5 @@
 use super::api_client::{ApiClient, AuthMethod, AuthProvider};
-use super::azureauth::{AuthError, AzureAuth};
+use super::azureauth::{map_auth_error, require_tenant_and_client_ids, AzureAuth};
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::embedding::{EmbeddingCapable, EmbeddingRequest, EmbeddingResponse};
 use super::errors::ProviderError;
@@ -113,37 +113,18 @@ impl OpenAiProvider {
         let auth = if use_managed_identity {
             // Use Managed Identity authentication
             let azure_auth = if let Some(client_id) = &entra_client_id {
-                // User-assigned managed identity
-                AzureAuth::with_user_assigned_managed_identity(
-                    client_id.clone(),
-                    entra_token_scope,
-                )
+                AzureAuth::with_user_assigned_managed_identity(client_id.clone(), entra_token_scope)
             } else {
-                // System-assigned managed identity
                 AzureAuth::with_managed_identity(entra_token_scope)
             }
-            .map_err(|e| match e {
-                AuthError::Credentials(msg) => {
-                    anyhow::anyhow!("Managed identity credentials error: {}", msg)
-                }
-                AuthError::TokenExchange(msg) => {
-                    anyhow::anyhow!("Managed identity token exchange error: {}", msg)
-                }
-            })?;
+            .map_err(|e| map_auth_error(e, "Managed identity"))?;
 
             let auth_provider = EntraAuthProvider { auth: azure_auth };
             AuthMethod::Custom(Box::new(auth_provider))
         } else if let Some(cert_path) = &entra_certificate_path {
             // Use Client Certificate authentication from file
-            let (tenant_id, client_id) = match (&entra_tenant_id, &entra_client_id) {
-                (Some(t), Some(c)) => (t.clone(), c.clone()),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "When using certificate authentication, both OPENAI_AZURE_TENANT_ID \
-                         and OPENAI_AZURE_CLIENT_ID must be set."
-                    ));
-                }
-            };
+            let (tenant_id, client_id) =
+                require_tenant_and_client_ids(&entra_tenant_id, &entra_client_id, "OPENAI_AZURE")?;
 
             let azure_auth = AzureAuth::with_client_certificate_file(
                 tenant_id,
@@ -151,28 +132,14 @@ impl OpenAiProvider {
                 cert_path,
                 entra_token_scope,
             )
-            .map_err(|e| match e {
-                AuthError::Credentials(msg) => {
-                    anyhow::anyhow!("Certificate credentials error: {}", msg)
-                }
-                AuthError::TokenExchange(msg) => {
-                    anyhow::anyhow!("Certificate token exchange error: {}", msg)
-                }
-            })?;
+            .map_err(|e| map_auth_error(e, "Certificate"))?;
 
             let auth_provider = EntraAuthProvider { auth: azure_auth };
             AuthMethod::Custom(Box::new(auth_provider))
         } else if let Some(cert_pem) = &entra_certificate {
             // Use Client Certificate authentication from PEM content
-            let (tenant_id, client_id) = match (&entra_tenant_id, &entra_client_id) {
-                (Some(t), Some(c)) => (t.clone(), c.clone()),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "When using certificate authentication, both OPENAI_AZURE_TENANT_ID \
-                         and OPENAI_AZURE_CLIENT_ID must be set."
-                    ));
-                }
-            };
+            let (tenant_id, client_id) =
+                require_tenant_and_client_ids(&entra_tenant_id, &entra_client_id, "OPENAI_AZURE")?;
 
             let azure_auth = AzureAuth::with_client_certificate(
                 tenant_id,
@@ -180,28 +147,14 @@ impl OpenAiProvider {
                 cert_pem.clone(),
                 entra_token_scope,
             )
-            .map_err(|e| match e {
-                AuthError::Credentials(msg) => {
-                    anyhow::anyhow!("Certificate credentials error: {}", msg)
-                }
-                AuthError::TokenExchange(msg) => {
-                    anyhow::anyhow!("Certificate token exchange error: {}", msg)
-                }
-            })?;
+            .map_err(|e| map_auth_error(e, "Certificate"))?;
 
             let auth_provider = EntraAuthProvider { auth: azure_auth };
             AuthMethod::Custom(Box::new(auth_provider))
         } else if let Some(client_secret) = &entra_client_secret {
             // Use Client Secret authentication
-            let (tenant_id, client_id) = match (&entra_tenant_id, &entra_client_id) {
-                (Some(t), Some(c)) => (t.clone(), c.clone()),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "When using client secret authentication, both OPENAI_AZURE_TENANT_ID \
-                         and OPENAI_AZURE_CLIENT_ID must be set."
-                    ));
-                }
-            };
+            let (tenant_id, client_id) =
+                require_tenant_and_client_ids(&entra_tenant_id, &entra_client_id, "OPENAI_AZURE")?;
 
             let azure_auth = AzureAuth::with_client_secret(
                 tenant_id,
@@ -209,12 +162,7 @@ impl OpenAiProvider {
                 client_secret.clone(),
                 entra_token_scope,
             )
-            .map_err(|e| match e {
-                AuthError::Credentials(msg) => anyhow::anyhow!("Entra credentials error: {}", msg),
-                AuthError::TokenExchange(msg) => {
-                    anyhow::anyhow!("Entra token exchange error: {}", msg)
-                }
-            })?;
+            .map_err(|e| map_auth_error(e, "Client secret"))?;
 
             let auth_provider = EntraAuthProvider { auth: azure_auth };
             AuthMethod::Custom(Box::new(auth_provider))

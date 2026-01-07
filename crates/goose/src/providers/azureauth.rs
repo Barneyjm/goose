@@ -24,6 +24,35 @@ fn format_scope(resource: &str) -> String {
     }
 }
 
+/// Maps an AuthError to an anyhow::Error with a contextual prefix.
+/// This helper is used by both OpenAI and Azure providers to standardize error handling.
+pub fn map_auth_error(error: AuthError, context: &str) -> anyhow::Error {
+    match error {
+        AuthError::Credentials(msg) => anyhow::anyhow!("{} credentials error: {}", context, msg),
+        AuthError::TokenExchange(msg) => {
+            anyhow::anyhow!("{} token exchange error: {}", context, msg)
+        }
+    }
+}
+
+/// Validates that both tenant_id and client_id are provided for authentication methods
+/// that require them (client secret, client certificate).
+/// Returns a tuple of (tenant_id, client_id) on success.
+pub fn require_tenant_and_client_ids(
+    tenant_id: &Option<String>,
+    client_id: &Option<String>,
+    env_prefix: &str,
+) -> Result<(String, String), anyhow::Error> {
+    match (tenant_id, client_id) {
+        (Some(t), Some(c)) => Ok((t.clone(), c.clone())),
+        _ => Err(anyhow::anyhow!(
+            "When using service principal authentication, both {}_TENANT_ID and {}_CLIENT_ID must be set.",
+            env_prefix,
+            env_prefix
+        )),
+    }
+}
+
 /// Represents errors that can occur during Azure authentication.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -218,11 +247,18 @@ struct CertificateAssertionClaims {
     sub: String,
 }
 
+/// Default Azure AD authority URL
+const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com";
+
 /// Azure authentication handler that manages credentials and token caching.
 pub struct AzureAuth {
     credentials: AzureCredentials,
     cached_token: Arc<RwLock<Option<CachedToken>>>,
     http_client: reqwest::Client,
+    /// Azure AD authority URL (configurable for testing)
+    token_authority: String,
+    /// IMDS endpoint URL (configurable for testing)
+    imds_endpoint: String,
 }
 
 impl std::fmt::Debug for AzureAuth {
@@ -230,14 +266,29 @@ impl std::fmt::Debug for AzureAuth {
         f.debug_struct("AzureAuth")
             .field("credentials", &self.credentials)
             .field("cached_token", &"[cached]")
+            .field("token_authority", &self.token_authority)
+            .field("imds_endpoint", &self.imds_endpoint)
             .finish()
     }
 }
 
 impl AzureAuth {
-    /// Creates a new AzureAuth instance with the given credentials.
+    /// Creates a new AzureAuth instance with the given credentials and default endpoints.
     /// This is a private helper to avoid duplicating HTTP client initialization.
     fn new_with_credentials(credentials: AzureCredentials) -> Result<Self, AuthError> {
+        Self::new_with_credentials_and_endpoints(
+            credentials,
+            DEFAULT_AUTHORITY.to_string(),
+            IMDS_ENDPOINT.to_string(),
+        )
+    }
+
+    /// Creates a new AzureAuth instance with custom endpoints for testing.
+    fn new_with_credentials_and_endpoints(
+        credentials: AzureCredentials,
+        token_authority: String,
+        imds_endpoint: String,
+    ) -> Result<Self, AuthError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -247,7 +298,20 @@ impl AzureAuth {
             credentials,
             cached_token: Arc::new(RwLock::new(None)),
             http_client,
+            token_authority,
+            imds_endpoint,
         })
+    }
+
+    /// Creates a new AzureAuth instance with custom endpoints.
+    /// This is useful for unit testing with mock servers.
+    #[cfg(test)]
+    pub fn with_custom_endpoints(
+        credentials: AzureCredentials,
+        token_authority: String,
+        imds_endpoint: String,
+    ) -> Result<Self, AuthError> {
+        Self::new_with_credentials_and_endpoints(credentials, token_authority, imds_endpoint)
     }
 
     /// Creates a new Azure authentication handler.
@@ -506,6 +570,7 @@ impl AzureAuth {
         cred: &ClientSecretCredential,
     ) -> Result<AuthToken, AuthError> {
         let http_client = self.http_client.clone();
+        let token_authority = self.token_authority.clone();
         let tenant_id = cred.tenant_id.clone();
         let client_id = cred.client_id.clone();
         let client_secret = cred.client_secret.clone();
@@ -514,8 +579,8 @@ impl AzureAuth {
         self.get_or_refresh_token(|| async move {
             // Request new token from Azure AD OAuth2 endpoint
             let token_url = format!(
-                "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-                tenant_id
+                "{}/{}/oauth2/v2.0/token",
+                token_authority, tenant_id
             );
 
             let params = [
@@ -570,8 +635,8 @@ impl AzureAuth {
     ) -> Result<AuthToken, AuthError> {
         // Create JWT assertion for client certificate auth (done outside closure to avoid lifetime issues)
         let token_url = format!(
-            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-            cred.tenant_id
+            "{}/{}/oauth2/v2.0/token",
+            self.token_authority, cred.tenant_id
         );
         let assertion = self.create_certificate_assertion(cred, &token_url)?;
         let scope = format_scope(&cred.resource);
@@ -695,7 +760,7 @@ impl AzureAuth {
         cred: &ManagedIdentityCredential,
     ) -> Result<AuthToken, AuthError> {
         // Build IMDS request URL using url crate for proper encoding
-        let mut imds_url = Url::parse(IMDS_ENDPOINT)
+        let mut imds_url = Url::parse(&self.imds_endpoint)
             .map_err(|e| AuthError::Credentials(format!("Invalid IMDS endpoint URL: {}", e)))?;
 
         {
