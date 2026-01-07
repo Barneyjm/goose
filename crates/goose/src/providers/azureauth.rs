@@ -1,11 +1,16 @@
 use chrono;
-use serde::Deserialize;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Default Azure AD resource for cognitive services (used by Azure OpenAI)
 pub const AZURE_COGNITIVE_SERVICES_RESOURCE: &str = "https://cognitiveservices.azure.com";
+
+/// Azure Instance Metadata Service endpoint for managed identity
+const IMDS_ENDPOINT: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
 
 /// Represents errors that can occur during Azure authentication.
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +63,79 @@ impl ClientSecretCredential {
     }
 }
 
+/// Configuration for client certificate (service principal) authentication.
+#[derive(Debug, Clone)]
+pub struct ClientCertificateCredential {
+    /// Azure AD tenant ID
+    pub tenant_id: String,
+    /// Application (client) ID
+    pub client_id: String,
+    /// PEM-encoded certificate (including private key)
+    pub certificate_pem: String,
+    /// Resource/scope to request token for (defaults to cognitive services)
+    pub resource: String,
+}
+
+impl ClientCertificateCredential {
+    /// Creates a new client certificate credential configuration.
+    pub fn new(
+        tenant_id: String,
+        client_id: String,
+        certificate_pem: String,
+        resource: Option<String>,
+    ) -> Self {
+        Self {
+            tenant_id,
+            client_id,
+            certificate_pem,
+            resource: resource.unwrap_or_else(|| AZURE_COGNITIVE_SERVICES_RESOURCE.to_string()),
+        }
+    }
+
+    /// Loads certificate from a file path.
+    pub fn from_file(
+        tenant_id: String,
+        client_id: String,
+        certificate_path: &str,
+        resource: Option<String>,
+    ) -> Result<Self, AuthError> {
+        let certificate_pem = std::fs::read_to_string(certificate_path).map_err(|e| {
+            AuthError::Credentials(format!(
+                "Failed to read certificate file '{}': {}",
+                certificate_path, e
+            ))
+        })?;
+        Ok(Self::new(tenant_id, client_id, certificate_pem, resource))
+    }
+}
+
+/// Configuration for managed identity authentication.
+#[derive(Debug, Clone)]
+pub struct ManagedIdentityCredential {
+    /// Client ID for user-assigned managed identity (None for system-assigned)
+    pub client_id: Option<String>,
+    /// Resource/scope to request token for (defaults to cognitive services)
+    pub resource: String,
+}
+
+impl ManagedIdentityCredential {
+    /// Creates a new managed identity credential for system-assigned identity.
+    pub fn system_assigned(resource: Option<String>) -> Self {
+        Self {
+            client_id: None,
+            resource: resource.unwrap_or_else(|| AZURE_COGNITIVE_SERVICES_RESOURCE.to_string()),
+        }
+    }
+
+    /// Creates a new managed identity credential for user-assigned identity.
+    pub fn user_assigned(client_id: String, resource: Option<String>) -> Self {
+        Self {
+            client_id: Some(client_id),
+            resource: resource.unwrap_or_else(|| AZURE_COGNITIVE_SERVICES_RESOURCE.to_string()),
+        }
+    }
+}
+
 /// Represents the types of Azure credentials supported.
 #[derive(Debug, Clone)]
 pub enum AzureCredentials {
@@ -67,6 +145,10 @@ pub enum AzureCredentials {
     DefaultCredential,
     /// Client secret (service principal) based authentication
     ClientSecret(ClientSecretCredential),
+    /// Client certificate (service principal) based authentication
+    ClientCertificate(ClientCertificateCredential),
+    /// Managed identity based authentication (for Azure-hosted environments)
+    ManagedIdentity(ManagedIdentityCredential),
 }
 
 /// Holds a cached token and its expiration time.
@@ -94,6 +176,34 @@ struct OAuth2TokenResponse {
     token_type: String,
     /// Token lifetime in seconds
     expires_in: u64,
+}
+
+/// Response from Azure IMDS token endpoint
+#[derive(Debug, Clone, Deserialize)]
+struct ImdsTokenResponse {
+    access_token: String,
+    token_type: String,
+    /// Token expiry as Unix timestamp string
+    expires_on: String,
+}
+
+/// JWT claims for client certificate assertion
+#[derive(Debug, Serialize)]
+struct CertificateAssertionClaims {
+    /// Audience (token endpoint URL)
+    aud: String,
+    /// Expiration time
+    exp: i64,
+    /// Issued at time
+    iat: i64,
+    /// Issuer (client ID)
+    iss: String,
+    /// JWT ID (unique identifier)
+    jti: String,
+    /// Not before time
+    nbf: i64,
+    /// Subject (client ID)
+    sub: String,
 }
 
 /// Azure authentication handler that manages credentials and token caching.
@@ -179,6 +289,132 @@ impl AzureAuth {
         })
     }
 
+    /// Creates a new Azure authentication handler with client certificate credentials.
+    ///
+    /// This method configures authentication using a service principal (application)
+    /// with a client certificate, suitable for secure server-to-server authentication.
+    ///
+    /// # Arguments
+    /// * `tenant_id` - Azure AD tenant ID
+    /// * `client_id` - Application (client) ID
+    /// * `certificate_pem` - PEM-encoded certificate with private key
+    /// * `resource` - Optional resource/scope (defaults to cognitive services)
+    ///
+    /// # Returns
+    /// * `Result<Self, AuthError>` - A new AzureAuth instance or an error if initialization fails
+    pub fn with_client_certificate(
+        tenant_id: String,
+        client_id: String,
+        certificate_pem: String,
+        resource: Option<String>,
+    ) -> Result<Self, AuthError> {
+        let credentials = AzureCredentials::ClientCertificate(ClientCertificateCredential::new(
+            tenant_id,
+            client_id,
+            certificate_pem,
+            resource,
+        ));
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            credentials,
+            cached_token: Arc::new(RwLock::new(None)),
+            http_client,
+        })
+    }
+
+    /// Creates a new Azure authentication handler with client certificate from file.
+    ///
+    /// # Arguments
+    /// * `tenant_id` - Azure AD tenant ID
+    /// * `client_id` - Application (client) ID
+    /// * `certificate_path` - Path to PEM file containing certificate and private key
+    /// * `resource` - Optional resource/scope (defaults to cognitive services)
+    ///
+    /// # Returns
+    /// * `Result<Self, AuthError>` - A new AzureAuth instance or an error if initialization fails
+    pub fn with_client_certificate_file(
+        tenant_id: String,
+        client_id: String,
+        certificate_path: &str,
+        resource: Option<String>,
+    ) -> Result<Self, AuthError> {
+        let cred =
+            ClientCertificateCredential::from_file(tenant_id, client_id, certificate_path, resource)?;
+        let credentials = AzureCredentials::ClientCertificate(cred);
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            credentials,
+            cached_token: Arc::new(RwLock::new(None)),
+            http_client,
+        })
+    }
+
+    /// Creates a new Azure authentication handler for system-assigned managed identity.
+    ///
+    /// Use this when running in an Azure environment (VM, App Service, AKS, etc.)
+    /// with a system-assigned managed identity.
+    ///
+    /// # Arguments
+    /// * `resource` - Optional resource/scope (defaults to cognitive services)
+    ///
+    /// # Returns
+    /// * `Result<Self, AuthError>` - A new AzureAuth instance or an error if initialization fails
+    pub fn with_managed_identity(resource: Option<String>) -> Result<Self, AuthError> {
+        let credentials =
+            AzureCredentials::ManagedIdentity(ManagedIdentityCredential::system_assigned(resource));
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            credentials,
+            cached_token: Arc::new(RwLock::new(None)),
+            http_client,
+        })
+    }
+
+    /// Creates a new Azure authentication handler for user-assigned managed identity.
+    ///
+    /// Use this when running in an Azure environment with a user-assigned managed identity.
+    ///
+    /// # Arguments
+    /// * `client_id` - The client ID of the user-assigned managed identity
+    /// * `resource` - Optional resource/scope (defaults to cognitive services)
+    ///
+    /// # Returns
+    /// * `Result<Self, AuthError>` - A new AzureAuth instance or an error if initialization fails
+    pub fn with_user_assigned_managed_identity(
+        client_id: String,
+        resource: Option<String>,
+    ) -> Result<Self, AuthError> {
+        let credentials = AzureCredentials::ManagedIdentity(
+            ManagedIdentityCredential::user_assigned(client_id, resource),
+        );
+
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| AuthError::Credentials(format!("Failed to create HTTP client: {}", e)))?;
+
+        Ok(Self {
+            credentials,
+            cached_token: Arc::new(RwLock::new(None)),
+            http_client,
+        })
+    }
+
     /// Returns the type of credentials being used.
     pub fn credential_type(&self) -> &AzureCredentials {
         &self.credentials
@@ -196,6 +432,13 @@ impl AzureAuth {
     /// 3. For client secret auth:
     ///    a. Uses cached token if valid
     ///    b. Requests new token from Azure AD OAuth2 endpoint if needed
+    /// 4. For client certificate auth:
+    ///    a. Uses cached token if valid
+    ///    b. Creates JWT assertion signed with certificate
+    ///    c. Exchanges JWT for access token
+    /// 5. For managed identity:
+    ///    a. Uses cached token if valid
+    ///    b. Requests token from IMDS endpoint
     ///
     /// # Returns
     /// * `Result<AuthToken, AuthError>` - A valid authentication token or an error
@@ -207,6 +450,10 @@ impl AzureAuth {
             }),
             AzureCredentials::DefaultCredential => self.get_default_credential_token().await,
             AzureCredentials::ClientSecret(cred) => self.get_client_secret_token(cred).await,
+            AzureCredentials::ClientCertificate(cred) => {
+                self.get_client_certificate_token(cred).await
+            }
+            AzureCredentials::ManagedIdentity(cred) => self.get_managed_identity_token(cred).await,
         }
     }
 
@@ -353,6 +600,256 @@ impl AzureAuth {
 
         Ok(auth_token)
     }
+
+    /// Retrieves a token using client certificate credentials via Azure AD OAuth2 endpoint.
+    async fn get_client_certificate_token(
+        &self,
+        cred: &ClientCertificateCredential,
+    ) -> Result<AuthToken, AuthError> {
+        // Try read lock first for better concurrency
+        if let Some(cached) = self.cached_token.read().await.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Take write lock only if needed
+        let mut token_guard = self.cached_token.write().await;
+
+        // Double-check expiration after acquiring write lock
+        if let Some(cached) = token_guard.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Create JWT assertion for client certificate auth
+        let token_url = format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            cred.tenant_id
+        );
+
+        let assertion = self.create_certificate_assertion(cred, &token_url)?;
+
+        // Build scope from resource
+        let scope = if cred.resource.ends_with("/.default") {
+            cred.resource.clone()
+        } else {
+            format!("{}/.default", cred.resource)
+        };
+
+        let params = [
+            ("grant_type", "client_credentials"),
+            ("client_id", cred.client_id.as_str()),
+            (
+                "client_assertion_type",
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            ),
+            ("client_assertion", assertion.as_str()),
+            ("scope", scope.as_str()),
+        ];
+
+        let response = self
+            .http_client
+            .post(&token_url)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| AuthError::TokenExchange(format!("Failed to request token: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AuthError::TokenExchange(format!(
+                "Token request failed with status {}: {}",
+                status, error_body
+            )));
+        }
+
+        let token_response: OAuth2TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AuthError::TokenExchange(format!("Invalid token response: {}", e)))?;
+
+        let auth_token = AuthToken {
+            token_type: token_response.token_type,
+            token_value: token_response.access_token,
+        };
+
+        // Cache with 30 second buffer before expiry
+        let expires_at =
+            Instant::now() + Duration::from_secs(token_response.expires_in.saturating_sub(30));
+
+        *token_guard = Some(CachedToken {
+            token: auth_token.clone(),
+            expires_at,
+        });
+
+        Ok(auth_token)
+    }
+
+    /// Creates a JWT assertion for client certificate authentication.
+    fn create_certificate_assertion(
+        &self,
+        cred: &ClientCertificateCredential,
+        audience: &str,
+    ) -> Result<String, AuthError> {
+        // Parse the PEM to extract the private key and certificate
+        let key = EncodingKey::from_rsa_pem(cred.certificate_pem.as_bytes()).map_err(|e| {
+            AuthError::Credentials(format!("Failed to parse certificate private key: {}", e))
+        })?;
+
+        // Extract certificate thumbprint (SHA-256 hash of DER-encoded certificate)
+        let thumbprint = self.extract_certificate_thumbprint(&cred.certificate_pem)?;
+
+        // Create JWT header with x5t#S256 (certificate thumbprint)
+        let mut header = Header::new(Algorithm::RS256);
+        header.x5t_s256 = Some(thumbprint);
+
+        // Create JWT claims
+        let now = chrono::Utc::now().timestamp();
+        let claims = CertificateAssertionClaims {
+            aud: audience.to_string(),
+            exp: now + 600, // 10 minutes
+            iat: now,
+            iss: cred.client_id.clone(),
+            jti: uuid::Uuid::new_v4().to_string(),
+            nbf: now,
+            sub: cred.client_id.clone(),
+        };
+
+        encode(&header, &claims, &key)
+            .map_err(|e| AuthError::Credentials(format!("Failed to create JWT assertion: {}", e)))
+    }
+
+    /// Extracts the SHA-256 thumbprint from a PEM certificate.
+    fn extract_certificate_thumbprint(&self, pem: &str) -> Result<String, AuthError> {
+        // Find the certificate section in the PEM
+        let cert_start = pem
+            .find("-----BEGIN CERTIFICATE-----")
+            .ok_or_else(|| AuthError::Credentials("No certificate found in PEM".to_string()))?;
+        let cert_end = pem[cert_start..]
+            .find("-----END CERTIFICATE-----")
+            .ok_or_else(|| AuthError::Credentials("Invalid certificate in PEM".to_string()))?
+            + cert_start
+            + "-----END CERTIFICATE-----".len();
+
+        let cert_pem = &pem[cert_start..cert_end];
+
+        // Extract base64 content (remove headers and whitespace)
+        let base64_content: String = cert_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Decode base64 to get DER
+        let der = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &base64_content)
+            .map_err(|e| AuthError::Credentials(format!("Failed to decode certificate: {}", e)))?;
+
+        // Calculate SHA-256 hash
+        let mut hasher = Sha256::new();
+        hasher.update(&der);
+        let hash = hasher.finalize();
+
+        // Encode as base64url (without padding)
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            hash,
+        ))
+    }
+
+    /// Retrieves a token using managed identity via Azure IMDS endpoint.
+    async fn get_managed_identity_token(
+        &self,
+        cred: &ManagedIdentityCredential,
+    ) -> Result<AuthToken, AuthError> {
+        // Try read lock first for better concurrency
+        if let Some(cached) = self.cached_token.read().await.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Take write lock only if needed
+        let mut token_guard = self.cached_token.write().await;
+
+        // Double-check expiration after acquiring write lock
+        if let Some(cached) = token_guard.as_ref() {
+            if cached.expires_at > Instant::now() {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        // Build IMDS request URL
+        let mut url = format!(
+            "{}?api-version=2018-02-01&resource={}",
+            IMDS_ENDPOINT, cred.resource
+        );
+
+        // Add client_id for user-assigned managed identity
+        if let Some(client_id) = &cred.client_id {
+            url = format!("{}&client_id={}", url, client_id);
+        }
+
+        let response = self
+            .http_client
+            .get(&url)
+            .header("Metadata", "true")
+            .send()
+            .await
+            .map_err(|e| {
+                AuthError::TokenExchange(format!(
+                    "Failed to request token from IMDS (are you running in Azure?): {}",
+                    e
+                ))
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AuthError::TokenExchange(format!(
+                "IMDS token request failed with status {} (ensure managed identity is configured): {}",
+                status, error_body
+            )));
+        }
+
+        let token_response: ImdsTokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AuthError::TokenExchange(format!("Invalid IMDS token response: {}", e)))?;
+
+        let auth_token = AuthToken {
+            token_type: token_response.token_type,
+            token_value: token_response.access_token,
+        };
+
+        // Parse expires_on as Unix timestamp and calculate duration
+        let expires_on: u64 = token_response
+            .expires_on
+            .parse()
+            .map_err(|e| AuthError::TokenExchange(format!("Invalid expires_on value: {}", e)))?;
+
+        let expires_at = Instant::now()
+            + Duration::from_secs(
+                expires_on
+                    .saturating_sub(chrono::Utc::now().timestamp() as u64)
+                    .saturating_sub(30),
+            );
+
+        *token_guard = Some(CachedToken {
+            token: auth_token.clone(),
+            expires_at,
+        });
+
+        Ok(auth_token)
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +968,92 @@ mod tests {
         match auth.credential_type() {
             AzureCredentials::DefaultCredential => {}
             _ => panic!("Expected DefaultCredential type"),
+        }
+    }
+
+    #[test]
+    fn test_managed_identity_system_assigned() {
+        let cred = ManagedIdentityCredential::system_assigned(None);
+
+        assert!(cred.client_id.is_none());
+        assert_eq!(cred.resource, AZURE_COGNITIVE_SERVICES_RESOURCE);
+    }
+
+    #[test]
+    fn test_managed_identity_user_assigned() {
+        let cred = ManagedIdentityCredential::user_assigned(
+            "my-identity-client-id".to_string(),
+            Some("https://custom.resource.com".to_string()),
+        );
+
+        assert_eq!(cred.client_id, Some("my-identity-client-id".to_string()));
+        assert_eq!(cred.resource, "https://custom.resource.com");
+    }
+
+    #[test]
+    fn test_azure_auth_with_managed_identity() {
+        let auth = AzureAuth::with_managed_identity(None).unwrap();
+
+        match auth.credential_type() {
+            AzureCredentials::ManagedIdentity(cred) => {
+                assert!(cred.client_id.is_none());
+            }
+            _ => panic!("Expected ManagedIdentity credential type"),
+        }
+    }
+
+    #[test]
+    fn test_azure_auth_with_user_assigned_managed_identity() {
+        let auth = AzureAuth::with_user_assigned_managed_identity(
+            "my-identity-id".to_string(),
+            None,
+        )
+        .unwrap();
+
+        match auth.credential_type() {
+            AzureCredentials::ManagedIdentity(cred) => {
+                assert_eq!(cred.client_id, Some("my-identity-id".to_string()));
+            }
+            _ => panic!("Expected ManagedIdentity credential type"),
+        }
+    }
+
+    #[test]
+    fn test_client_certificate_credential_new() {
+        let cred = ClientCertificateCredential::new(
+            "tenant-123".to_string(),
+            "client-456".to_string(),
+            "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string(),
+            None,
+        );
+
+        assert_eq!(cred.tenant_id, "tenant-123");
+        assert_eq!(cred.client_id, "client-456");
+        assert!(cred.certificate_pem.contains("BEGIN CERTIFICATE"));
+        assert_eq!(cred.resource, AZURE_COGNITIVE_SERVICES_RESOURCE);
+    }
+
+    #[test]
+    fn test_azure_auth_with_client_certificate() {
+        // We can't fully test this without a valid certificate,
+        // but we can verify the struct is created correctly
+        let result = AzureAuth::with_client_certificate(
+            "tenant-123".to_string(),
+            "client-456".to_string(),
+            "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----".to_string(),
+            None,
+        );
+
+        // It should succeed in creating the struct (even if the cert is invalid)
+        assert!(result.is_ok());
+
+        let auth = result.unwrap();
+        match auth.credential_type() {
+            AzureCredentials::ClientCertificate(cred) => {
+                assert_eq!(cred.tenant_id, "tenant-123");
+                assert_eq!(cred.client_id, "client-456");
+            }
+            _ => panic!("Expected ClientCertificate credential type"),
         }
     }
 }
