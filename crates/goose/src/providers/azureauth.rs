@@ -66,7 +66,7 @@ pub enum AuthError {
 }
 
 /// Represents an authentication token with its type and value.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthToken {
     /// The type of the token (e.g., "Bearer")
     pub token_type: String,
@@ -74,8 +74,17 @@ pub struct AuthToken {
     pub token_value: String,
 }
 
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthToken")
+            .field("token_type", &self.token_type)
+            .field("token_value", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Configuration for client secret (service principal) authentication.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientSecretCredential {
     /// Azure AD tenant ID
     pub tenant_id: String,
@@ -85,6 +94,17 @@ pub struct ClientSecretCredential {
     pub client_secret: String,
     /// Resource/scope to request token for (defaults to cognitive services)
     pub resource: String,
+}
+
+impl std::fmt::Debug for ClientSecretCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientSecretCredential")
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 impl ClientSecretCredential {
@@ -105,7 +125,7 @@ impl ClientSecretCredential {
 }
 
 /// Configuration for client certificate (service principal) authentication.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientCertificateCredential {
     /// Azure AD tenant ID
     pub tenant_id: String,
@@ -115,6 +135,17 @@ pub struct ClientCertificateCredential {
     pub certificate_pem: String,
     /// Resource/scope to request token for (defaults to cognitive services)
     pub resource: String,
+}
+
+impl std::fmt::Debug for ClientCertificateCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCertificateCredential")
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field("certificate_pem", &"[redacted]")
+            .field("resource", &self.resource)
+            .finish()
+    }
 }
 
 impl ClientCertificateCredential {
@@ -178,7 +209,7 @@ impl ManagedIdentityCredential {
 }
 
 /// Represents the types of Azure credentials supported.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AzureCredentials {
     /// API key based authentication
     ApiKey(String),
@@ -190,6 +221,20 @@ pub enum AzureCredentials {
     ClientCertificate(ClientCertificateCredential),
     /// Managed identity based authentication (for Azure-hosted environments)
     ManagedIdentity(ManagedIdentityCredential),
+}
+
+impl std::fmt::Debug for AzureCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.debug_tuple("ApiKey").field(&"[redacted]").finish(),
+            Self::DefaultCredential => write!(f, "DefaultCredential"),
+            Self::ClientSecret(cred) => f.debug_tuple("ClientSecret").field(cred).finish(),
+            Self::ClientCertificate(cred) => {
+                f.debug_tuple("ClientCertificate").field(cred).finish()
+            }
+            Self::ManagedIdentity(cred) => f.debug_tuple("ManagedIdentity").field(cred).finish(),
+        }
+    }
 }
 
 /// Holds a cached token and its expiration time.
@@ -904,10 +949,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_secret_token_request() {
+    async fn test_client_secret_token_request_with_mock_server() {
         let mock_server = MockServer::start().await;
 
-        // Create a custom AzureAuth that points to our mock server
         let tenant_id = "test-tenant";
         let client_id = "test-client";
         let client_secret = "test-secret";
@@ -925,19 +969,63 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Create credential with custom resource that includes our mock server URL
-        let cred = ClientSecretCredential {
-            tenant_id: tenant_id.to_string(),
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
-            resource: "https://cognitiveservices.azure.com".to_string(),
-        };
+        // Create credential and use with_custom_endpoints to point to mock server
+        let credentials = AzureCredentials::ClientSecret(ClientSecretCredential::new(
+            tenant_id.to_string(),
+            client_id.to_string(),
+            client_secret.to_string(),
+            None,
+        ));
 
-        // We can't easily test the full flow because the token URL is hardcoded,
-        // but we can verify the credential struct was created correctly
-        assert_eq!(cred.tenant_id, tenant_id);
-        assert_eq!(cred.client_id, client_id);
-        assert_eq!(cred.client_secret, client_secret);
+        let auth = AzureAuth::with_custom_endpoints(
+            credentials,
+            mock_server.uri(),
+            "http://169.254.169.254/metadata/identity/oauth2/token".to_string(),
+        )
+        .unwrap();
+
+        // Test the full token acquisition flow
+        let token = auth.get_token().await.unwrap();
+
+        assert_eq!(token.token_type, "Bearer");
+        assert_eq!(token.token_value, "mock-access-token");
+    }
+
+    #[tokio::test]
+    async fn test_managed_identity_token_request_with_mock_server() {
+        use wiremock::matchers::{header, query_param};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock the IMDS endpoint response
+        Mock::given(method("GET"))
+            .and(query_param("api-version", "2018-02-01"))
+            .and(query_param("resource", AZURE_COGNITIVE_SERVICES_RESOURCE))
+            .and(header("Metadata", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mock-managed-identity-token",
+                "token_type": "Bearer",
+                "expires_on": "9999999999"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Create managed identity credential with mock IMDS endpoint
+        let credentials =
+            AzureCredentials::ManagedIdentity(ManagedIdentityCredential::system_assigned(None));
+
+        let auth = AzureAuth::with_custom_endpoints(
+            credentials,
+            "https://login.microsoftonline.com".to_string(),
+            mock_server.uri(),
+        )
+        .unwrap();
+
+        // Test the full token acquisition flow
+        let token = auth.get_token().await.unwrap();
+
+        assert_eq!(token.token_type, "Bearer");
+        assert_eq!(token.token_value, "mock-managed-identity-token");
     }
 
     #[test]
