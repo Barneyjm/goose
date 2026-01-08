@@ -1,3 +1,105 @@
+//! # Azure Entra ID (Azure AD) Authentication Module
+//!
+//! This module provides Azure Entra ID authentication support for both the OpenAI provider
+//! (when using OpenAI endpoints protected by Entra ID) and the Azure OpenAI provider.
+//!
+//! ## Design Pattern
+//!
+//! This implementation follows the pattern established by the **OpenAI Python SDK's
+//! `azure_ad_token_provider`** parameter, which allows users to provide a callable that
+//! returns a valid Azure AD token. This Rust implementation provides the same capability
+//! with automatic token caching and refresh.
+//!
+//! ## Supported Authentication Methods
+//!
+//! The following authentication methods are supported, in priority order:
+//!
+//! 1. **Managed Identity** - For Azure-hosted workloads (VMs, App Service, AKS, etc.)
+//! 2. **Client Certificate** - Service principal auth with X.509 certificate
+//! 3. **Client Secret** - Service principal auth with client secret
+//! 4. **API Key** - Traditional API key authentication (Azure OpenAI only)
+//! 5. **Default Credential** - Falls back to Azure CLI authentication
+//!
+//! ## Environment Variables
+//!
+//! ### For OpenAI Provider (`openai` provider with Entra ID protection)
+//!
+//! Use the `OPENAI_AZURE_*` prefix for OpenAI endpoints protected by Entra ID:
+//!
+//! | Variable | Description | Required |
+//! |----------|-------------|----------|
+//! | `OPENAI_AZURE_TENANT_ID` | Azure AD tenant ID | For client secret/certificate auth |
+//! | `OPENAI_AZURE_CLIENT_ID` | Application (client) ID | For client secret/certificate/user-assigned MI |
+//! | `OPENAI_AZURE_CLIENT_SECRET` | Client secret value | For client secret auth |
+//! | `OPENAI_AZURE_CERTIFICATE_PATH` | Path to PEM certificate file | For certificate auth (file) |
+//! | `OPENAI_AZURE_CERTIFICATE` | PEM certificate content | For certificate auth (inline) |
+//! | `OPENAI_AZURE_TOKEN_SCOPE` | Custom token scope/resource | Optional (defaults to cognitive services) |
+//! | `OPENAI_AZURE_USE_MANAGED_IDENTITY` | Set to "true" or "1" | For managed identity auth |
+//!
+//! ### For Azure OpenAI Provider (`azure` provider)
+//!
+//! Use the `AZURE_OPENAI_*` prefix for Azure OpenAI Service:
+//!
+//! | Variable | Description | Required |
+//! |----------|-------------|----------|
+//! | `AZURE_OPENAI_TENANT_ID` | Azure AD tenant ID | For client secret/certificate auth |
+//! | `AZURE_OPENAI_CLIENT_ID` | Application (client) ID | For client secret/certificate/user-assigned MI |
+//! | `AZURE_OPENAI_CLIENT_SECRET` | Client secret value | For client secret auth |
+//! | `AZURE_OPENAI_CERTIFICATE_PATH` | Path to PEM certificate file | For certificate auth (file) |
+//! | `AZURE_OPENAI_CERTIFICATE` | PEM certificate content | For certificate auth (inline) |
+//! | `AZURE_OPENAI_TOKEN_SCOPE` | Custom token scope/resource | Optional (defaults to cognitive services) |
+//! | `AZURE_OPENAI_USE_MANAGED_IDENTITY` | Set to "true" or "1" | For managed identity auth |
+//! | `AZURE_OPENAI_API_KEY` | API key (alternative to Entra auth) | For API key auth |
+//!
+//! ## Usage Examples
+//!
+//! ### Client Secret Authentication
+//!
+//! ```bash
+//! # For OpenAI provider with Entra ID
+//! export OPENAI_AZURE_TENANT_ID="your-tenant-id"
+//! export OPENAI_AZURE_CLIENT_ID="your-client-id"
+//! export OPENAI_AZURE_CLIENT_SECRET="your-client-secret"
+//!
+//! # For Azure OpenAI provider
+//! export AZURE_OPENAI_TENANT_ID="your-tenant-id"
+//! export AZURE_OPENAI_CLIENT_ID="your-client-id"
+//! export AZURE_OPENAI_CLIENT_SECRET="your-client-secret"
+//! ```
+//!
+//! ### Managed Identity Authentication
+//!
+//! ```bash
+//! # System-assigned managed identity
+//! export OPENAI_AZURE_USE_MANAGED_IDENTITY="true"
+//!
+//! # User-assigned managed identity
+//! export OPENAI_AZURE_USE_MANAGED_IDENTITY="true"
+//! export OPENAI_AZURE_CLIENT_ID="your-managed-identity-client-id"
+//! ```
+//!
+//! ### Client Certificate Authentication
+//!
+//! ```bash
+//! # From file path
+//! export OPENAI_AZURE_TENANT_ID="your-tenant-id"
+//! export OPENAI_AZURE_CLIENT_ID="your-client-id"
+//! export OPENAI_AZURE_CERTIFICATE_PATH="/path/to/certificate.pem"
+//!
+//! # Or inline PEM content
+//! export OPENAI_AZURE_CERTIFICATE="-----BEGIN CERTIFICATE-----..."
+//! ```
+//!
+//! ## Token Caching and Refresh
+//!
+//! Tokens are automatically cached and refreshed 30 seconds before expiry. The implementation
+//! uses a double-checked locking pattern for thread-safe token caching in async contexts.
+//!
+//! ## Security
+//!
+//! All credential types implement custom `Debug` traits that redact sensitive information
+//! (secrets, certificates, tokens) to prevent accidental exposure in logs.
+
 use chrono;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
