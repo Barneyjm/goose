@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::api_client::{ApiClient, AuthMethod, AuthProvider};
-use super::azureauth::{map_auth_error, require_tenant_and_client_ids, AzureAuth};
+use super::azureauth::{AzureAuth, AzureAuthConfig};
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
 use super::formats::openai::{create_request, get_usage, response_to_message};
@@ -81,60 +81,25 @@ impl AzureProvider {
             .get_param("AZURE_OPENAI_API_VERSION")
             .unwrap_or_else(|_| AZURE_DEFAULT_API_VERSION.to_string());
 
-        // Check for various authentication configurations
-        let api_key = config
-            .get_secret("AZURE_OPENAI_API_KEY")
-            .ok()
-            .filter(|key: &String| !key.is_empty());
-        let tenant_id: Option<String> = config.get_param("AZURE_OPENAI_TENANT_ID").ok();
-        let client_id: Option<String> = config.get_param("AZURE_OPENAI_CLIENT_ID").ok();
-        let client_secret: Option<String> = config.get_secret("AZURE_OPENAI_CLIENT_SECRET").ok();
-        let certificate_path: Option<String> =
-            config.get_param("AZURE_OPENAI_CERTIFICATE_PATH").ok();
-        let certificate: Option<String> = config.get_secret("AZURE_OPENAI_CERTIFICATE").ok();
-        let token_scope: Option<String> = config.get_param("AZURE_OPENAI_TOKEN_SCOPE").ok();
-        let use_managed_identity: bool = config
-            .get_param::<String>("AZURE_OPENAI_USE_MANAGED_IDENTITY")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
-
-        // Determine auth method priority:
-        // 1. Managed Identity (if explicitly enabled)
-        // 2. Client Certificate (if certificate path or content provided)
-        // 3. Client Secret (if secret provided with tenant/client IDs)
-        // 4. API Key (if provided)
-        // 5. Default Credential (Azure CLI fallback)
-        let auth = if use_managed_identity {
-            // Use Managed Identity authentication
-            let azure_auth = if let Some(id) = &client_id {
-                AzureAuth::with_user_assigned_managed_identity(id.clone(), token_scope)
-            } else {
-                AzureAuth::with_managed_identity(token_scope)
-            }
-            .map_err(|e| map_auth_error(e, "Managed identity"))?;
-            azure_auth
-        } else if let Some(cert_path) = &certificate_path {
-            // Use Client Certificate authentication from file
-            let (t_id, c_id) =
-                require_tenant_and_client_ids(&tenant_id, &client_id, "AZURE_OPENAI")?;
-            AzureAuth::with_client_certificate_file(t_id, c_id, cert_path, token_scope)
-                .map_err(|e| map_auth_error(e, "Certificate"))?
-        } else if let Some(cert_pem) = &certificate {
-            // Use Client Certificate authentication from PEM content
-            let (t_id, c_id) =
-                require_tenant_and_client_ids(&tenant_id, &client_id, "AZURE_OPENAI")?;
-            AzureAuth::with_client_certificate(t_id, c_id, cert_pem.clone(), token_scope)
-                .map_err(|e| map_auth_error(e, "Certificate"))?
-        } else if let Some(secret) = &client_secret {
-            // Use Client Secret authentication
-            let (t_id, c_id) =
-                require_tenant_and_client_ids(&tenant_id, &client_id, "AZURE_OPENAI")?;
-            AzureAuth::with_client_secret(t_id, c_id, secret.clone(), token_scope)
-                .map_err(|e| map_auth_error(e, "Client secret"))?
-        } else {
-            // Use API Key or Default Credential (Azure CLI)
-            AzureAuth::new(api_key).map_err(|e| map_auth_error(e, "Azure"))?
+        // Build Azure authentication configuration
+        let auth_config = AzureAuthConfig {
+            tenant_id: config.get_param("AZURE_OPENAI_TENANT_ID").ok(),
+            client_id: config.get_param("AZURE_OPENAI_CLIENT_ID").ok(),
+            client_secret: config.get_secret("AZURE_OPENAI_CLIENT_SECRET").ok(),
+            certificate_path: config.get_param("AZURE_OPENAI_CERTIFICATE_PATH").ok(),
+            certificate_pem: config.get_secret("AZURE_OPENAI_CERTIFICATE").ok(),
+            token_scope: config.get_param("AZURE_OPENAI_TOKEN_SCOPE").ok(),
+            use_managed_identity: config
+                .get_param::<String>("AZURE_OPENAI_USE_MANAGED_IDENTITY")
+                .map(|v| v.to_lowercase() == "true" || v == "1")
+                .unwrap_or(false),
+            api_key: config
+                .get_secret("AZURE_OPENAI_API_KEY")
+                .ok()
+                .filter(|key: &String| !key.is_empty()),
         };
+
+        let auth = auth_config.build("AZURE_OPENAI")?;
 
         let auth_provider = AzureAuthProvider { auth };
         let api_client = ApiClient::new(endpoint, AuthMethod::Custom(Box::new(auth_provider)))?;

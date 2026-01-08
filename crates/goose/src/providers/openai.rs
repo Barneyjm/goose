@@ -1,5 +1,5 @@
 use super::api_client::{ApiClient, AuthMethod, AuthProvider};
-use super::azureauth::{map_auth_error, require_tenant_and_client_ids, AzureAuth};
+use super::azureauth::{AzureAuth, AzureAuthConfig};
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::embedding::{EmbeddingCapable, EmbeddingRequest, EmbeddingResponse};
 use super::errors::ProviderError;
@@ -90,80 +90,24 @@ impl OpenAiProvider {
 
         let config = crate::config::Config::global();
 
-        // Check for various Azure Entra ID authentication configurations
-        let entra_tenant_id: Option<String> = config.get_param("OPENAI_AZURE_TENANT_ID").ok();
-        let entra_client_id: Option<String> = config.get_param("OPENAI_AZURE_CLIENT_ID").ok();
-        let entra_client_secret: Option<String> =
-            config.get_secret("OPENAI_AZURE_CLIENT_SECRET").ok();
-        let entra_certificate_path: Option<String> =
-            config.get_param("OPENAI_AZURE_CERTIFICATE_PATH").ok();
-        let entra_certificate: Option<String> =
-            config.get_secret("OPENAI_AZURE_CERTIFICATE").ok();
-        let entra_token_scope: Option<String> = config.get_param("OPENAI_AZURE_TOKEN_SCOPE").ok();
-        let use_managed_identity: bool = config
-            .get_param::<String>("OPENAI_AZURE_USE_MANAGED_IDENTITY")
-            .map(|v| v.to_lowercase() == "true" || v == "1")
-            .unwrap_or(false);
+        // Build Azure Entra ID authentication configuration
+        let auth_config = AzureAuthConfig {
+            tenant_id: config.get_param("OPENAI_AZURE_TENANT_ID").ok(),
+            client_id: config.get_param("OPENAI_AZURE_CLIENT_ID").ok(),
+            client_secret: config.get_secret("OPENAI_AZURE_CLIENT_SECRET").ok(),
+            certificate_path: config.get_param("OPENAI_AZURE_CERTIFICATE_PATH").ok(),
+            certificate_pem: config.get_secret("OPENAI_AZURE_CERTIFICATE").ok(),
+            token_scope: config.get_param("OPENAI_AZURE_TOKEN_SCOPE").ok(),
+            use_managed_identity: config
+                .get_param::<String>("OPENAI_AZURE_USE_MANAGED_IDENTITY")
+                .map(|v| v.to_lowercase() == "true" || v == "1")
+                .unwrap_or(false),
+            api_key: None, // OpenAI uses BearerToken for API key, not AzureAuth
+        };
 
-        // Determine auth method priority:
-        // 1. Managed Identity (if explicitly enabled)
-        // 2. Client Certificate (if certificate path or content provided)
-        // 3. Client Secret (if secret provided)
-        // 4. API Key (default)
-        let auth = if use_managed_identity {
-            // Use Managed Identity authentication
-            let azure_auth = if let Some(client_id) = &entra_client_id {
-                AzureAuth::with_user_assigned_managed_identity(client_id.clone(), entra_token_scope)
-            } else {
-                AzureAuth::with_managed_identity(entra_token_scope)
-            }
-            .map_err(|e| map_auth_error(e, "Managed identity"))?;
-
-            let auth_provider = EntraAuthProvider { auth: azure_auth };
-            AuthMethod::Custom(Box::new(auth_provider))
-        } else if let Some(cert_path) = &entra_certificate_path {
-            // Use Client Certificate authentication from file
-            let (tenant_id, client_id) =
-                require_tenant_and_client_ids(&entra_tenant_id, &entra_client_id, "OPENAI_AZURE")?;
-
-            let azure_auth = AzureAuth::with_client_certificate_file(
-                tenant_id,
-                client_id,
-                cert_path,
-                entra_token_scope,
-            )
-            .map_err(|e| map_auth_error(e, "Certificate"))?;
-
-            let auth_provider = EntraAuthProvider { auth: azure_auth };
-            AuthMethod::Custom(Box::new(auth_provider))
-        } else if let Some(cert_pem) = &entra_certificate {
-            // Use Client Certificate authentication from PEM content
-            let (tenant_id, client_id) =
-                require_tenant_and_client_ids(&entra_tenant_id, &entra_client_id, "OPENAI_AZURE")?;
-
-            let azure_auth = AzureAuth::with_client_certificate(
-                tenant_id,
-                client_id,
-                cert_pem.clone(),
-                entra_token_scope,
-            )
-            .map_err(|e| map_auth_error(e, "Certificate"))?;
-
-            let auth_provider = EntraAuthProvider { auth: azure_auth };
-            AuthMethod::Custom(Box::new(auth_provider))
-        } else if let Some(client_secret) = &entra_client_secret {
-            // Use Client Secret authentication
-            let (tenant_id, client_id) =
-                require_tenant_and_client_ids(&entra_tenant_id, &entra_client_id, "OPENAI_AZURE")?;
-
-            let azure_auth = AzureAuth::with_client_secret(
-                tenant_id,
-                client_id,
-                client_secret.clone(),
-                entra_token_scope,
-            )
-            .map_err(|e| map_auth_error(e, "Client secret"))?;
-
+        // Use Entra auth if configured, otherwise fall back to API key
+        let auth = if auth_config.has_entra_auth() {
+            let azure_auth = auth_config.build("OPENAI_AZURE")?;
             let auth_provider = EntraAuthProvider { auth: azure_auth };
             AuthMethod::Custom(Box::new(auth_provider))
         } else {

@@ -53,6 +53,78 @@ pub fn require_tenant_and_client_ids(
     }
 }
 
+/// Configuration for building Azure authentication from environment variables.
+/// This struct is used to share auth configuration logic between OpenAI and Azure providers.
+#[derive(Debug, Default)]
+pub struct AzureAuthConfig {
+    pub tenant_id: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub certificate_path: Option<String>,
+    pub certificate_pem: Option<String>,
+    pub token_scope: Option<String>,
+    pub use_managed_identity: bool,
+    pub api_key: Option<String>,
+}
+
+impl AzureAuthConfig {
+    /// Creates a new empty auth configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds an AzureAuth instance based on the configuration.
+    /// Priority order: Managed Identity → Certificate → Client Secret → API Key → Default Credential
+    ///
+    /// # Arguments
+    /// * `env_prefix` - Prefix for error messages (e.g., "OPENAI_AZURE" or "AZURE_OPENAI")
+    ///
+    /// # Returns
+    /// * `Result<AzureAuth, anyhow::Error>` - The configured AzureAuth instance
+    pub fn build(self, env_prefix: &str) -> Result<AzureAuth, anyhow::Error> {
+        if self.use_managed_identity {
+            // Managed Identity authentication
+            let azure_auth = if let Some(client_id) = &self.client_id {
+                AzureAuth::with_user_assigned_managed_identity(client_id.clone(), self.token_scope)
+            } else {
+                AzureAuth::with_managed_identity(self.token_scope)
+            }
+            .map_err(|e| map_auth_error(e, "Managed identity"))?;
+            Ok(azure_auth)
+        } else if let Some(cert_path) = &self.certificate_path {
+            // Client Certificate authentication from file
+            let (tenant_id, client_id) =
+                require_tenant_and_client_ids(&self.tenant_id, &self.client_id, env_prefix)?;
+            AzureAuth::with_client_certificate_file(tenant_id, client_id, cert_path, self.token_scope)
+                .map_err(|e| map_auth_error(e, "Certificate"))
+        } else if let Some(cert_pem) = &self.certificate_pem {
+            // Client Certificate authentication from PEM content
+            let (tenant_id, client_id) =
+                require_tenant_and_client_ids(&self.tenant_id, &self.client_id, env_prefix)?;
+            AzureAuth::with_client_certificate(tenant_id, client_id, cert_pem.clone(), self.token_scope)
+                .map_err(|e| map_auth_error(e, "Certificate"))
+        } else if let Some(client_secret) = &self.client_secret {
+            // Client Secret authentication
+            let (tenant_id, client_id) =
+                require_tenant_and_client_ids(&self.tenant_id, &self.client_id, env_prefix)?;
+            AzureAuth::with_client_secret(tenant_id, client_id, client_secret.clone(), self.token_scope)
+                .map_err(|e| map_auth_error(e, "Client secret"))
+        } else {
+            // API Key or Default Credential (Azure CLI)
+            AzureAuth::new(self.api_key).map_err(|e| map_auth_error(e, "Azure"))
+        }
+    }
+
+    /// Returns true if any Entra ID authentication method is configured.
+    /// This is useful for determining whether to use Entra auth or fall back to API key.
+    pub fn has_entra_auth(&self) -> bool {
+        self.use_managed_identity
+            || self.certificate_path.is_some()
+            || self.certificate_pem.is_some()
+            || self.client_secret.is_some()
+    }
+}
+
 /// Represents errors that can occur during Azure authentication.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -554,7 +626,7 @@ impl AzureAuth {
     pub async fn get_token(&self) -> Result<AuthToken, AuthError> {
         match &self.credentials {
             AzureCredentials::ApiKey(key) => Ok(AuthToken {
-                token_type: "Bearer".to_string(),
+                token_type: "api-key".to_string(),
                 token_value: key.clone(),
             }),
             AzureCredentials::DefaultCredential => self.get_default_credential_token().await,
@@ -574,7 +646,7 @@ impl AzureAuth {
                     "account",
                     "get-access-token",
                     "--resource",
-                    "https://cognitiveservices.azure.com",
+                    AZURE_COGNITIVE_SERVICES_RESOURCE,
                 ])
                 .output()
                 .await
@@ -944,7 +1016,7 @@ mod tests {
         let auth = AzureAuth::new(Some("test-api-key".to_string())).unwrap();
         let token = auth.get_token().await.unwrap();
 
-        assert_eq!(token.token_type, "Bearer");
+        assert_eq!(token.token_type, "api-key");
         assert_eq!(token.token_value, "test-api-key");
     }
 
