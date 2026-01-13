@@ -284,17 +284,59 @@ impl Provider for OpenAiProvider {
                 ConfigKey::new("OPENAI_CUSTOM_HEADERS", false, true, None),
                 ConfigKey::new("OPENAI_TIMEOUT", false, false, Some("600")),
                 // Azure Entra ID authentication
-                ConfigKey::new("OPENAI_AZURE_TENANT_ID", false, false, None),
-                ConfigKey::new("OPENAI_AZURE_CLIENT_ID", false, false, None),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_TENANT_ID",
+                    false,
+                    false,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_CLIENT_ID",
+                    false,
+                    false,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
                 // Client secret auth
-                ConfigKey::new("OPENAI_AZURE_CLIENT_SECRET", false, true, None),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_CLIENT_SECRET",
+                    false,
+                    true,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
                 // Client certificate auth
-                ConfigKey::new("OPENAI_AZURE_CERTIFICATE_PATH", false, false, None),
-                ConfigKey::new("OPENAI_AZURE_CERTIFICATE", false, true, None),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_CERTIFICATE_PATH",
+                    false,
+                    false,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_CERTIFICATE",
+                    false,
+                    true,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
                 // Managed identity auth
-                ConfigKey::new("OPENAI_AZURE_USE_MANAGED_IDENTITY", false, false, None),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_USE_MANAGED_IDENTITY",
+                    false,
+                    false,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
                 // Token scope (applies to all Entra auth methods)
-                ConfigKey::new("OPENAI_AZURE_TOKEN_SCOPE", false, false, None),
+                ConfigKey::new_with_group(
+                    "OPENAI_AZURE_TOKEN_SCOPE",
+                    false,
+                    false,
+                    None,
+                    Some("Azure Entra ID Authentication"),
+                ),
             ],
         )
     }
