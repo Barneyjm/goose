@@ -197,20 +197,35 @@ impl AzureAuthConfig {
             // Client Certificate authentication from file
             let (tenant_id, client_id) =
                 require_tenant_and_client_ids(&self.tenant_id, &self.client_id, env_prefix)?;
-            AzureAuth::with_client_certificate_file(tenant_id, client_id, cert_path, self.token_scope)
-                .map_err(|e| map_auth_error(e, "Certificate"))
+            AzureAuth::with_client_certificate_file(
+                tenant_id,
+                client_id,
+                cert_path,
+                self.token_scope,
+            )
+            .map_err(|e| map_auth_error(e, "Certificate"))
         } else if let Some(cert_pem) = &self.certificate_pem {
             // Client Certificate authentication from PEM content
             let (tenant_id, client_id) =
                 require_tenant_and_client_ids(&self.tenant_id, &self.client_id, env_prefix)?;
-            AzureAuth::with_client_certificate(tenant_id, client_id, cert_pem.clone(), self.token_scope)
-                .map_err(|e| map_auth_error(e, "Certificate"))
+            AzureAuth::with_client_certificate(
+                tenant_id,
+                client_id,
+                cert_pem.clone(),
+                self.token_scope,
+            )
+            .map_err(|e| map_auth_error(e, "Certificate"))
         } else if let Some(client_secret) = &self.client_secret {
             // Client Secret authentication
             let (tenant_id, client_id) =
                 require_tenant_and_client_ids(&self.tenant_id, &self.client_id, env_prefix)?;
-            AzureAuth::with_client_secret(tenant_id, client_id, client_secret.clone(), self.token_scope)
-                .map_err(|e| map_auth_error(e, "Client secret"))
+            AzureAuth::with_client_secret(
+                tenant_id,
+                client_id,
+                client_secret.clone(),
+                self.token_scope,
+            )
+            .map_err(|e| map_auth_error(e, "Client secret"))
         } else {
             // API Key or Default Credential (Azure CLI)
             AzureAuth::new(self.api_key).map_err(|e| map_auth_error(e, "Azure"))
@@ -622,8 +637,12 @@ impl AzureAuth {
         certificate_path: &str,
         resource: Option<String>,
     ) -> Result<Self, AuthError> {
-        let cred =
-            ClientCertificateCredential::from_file(tenant_id, client_id, certificate_path, resource)?;
+        let cred = ClientCertificateCredential::from_file(
+            tenant_id,
+            client_id,
+            certificate_path,
+            resource,
+        )?;
         Self::new_with_credentials(AzureCredentials::ClientCertificate(cred))
     }
 
@@ -797,10 +816,7 @@ impl AzureAuth {
 
         self.get_or_refresh_token(|| async move {
             // Request new token from Azure AD OAuth2 endpoint
-            let token_url = format!(
-                "{}/{}/oauth2/v2.0/token",
-                token_authority, tenant_id
-            );
+            let token_url = format!("{}/{}/oauth2/v2.0/token", token_authority, tenant_id);
 
             let params = [
                 ("grant_type", "client_credentials"),
@@ -1134,7 +1150,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(format!("/{}/oauth2/v2.0/token", tenant_id)))
             .and(body_string_contains("grant_type=client_credentials"))
-            .and(body_string_contains(format!("client_id={}", client_id).as_str()))
+            .and(body_string_contains(
+                format!("client_id={}", client_id).as_str(),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "mock-access-token",
                 "token_type": "Bearer",
@@ -1245,11 +1263,9 @@ mod tests {
 
     #[test]
     fn test_azure_auth_with_user_assigned_managed_identity() {
-        let auth = AzureAuth::with_user_assigned_managed_identity(
-            "my-identity-id".to_string(),
-            None,
-        )
-        .unwrap();
+        let auth =
+            AzureAuth::with_user_assigned_managed_identity("my-identity-id".to_string(), None)
+                .unwrap();
 
         match auth.credential_type() {
             AzureCredentials::ManagedIdentity(cred) => {

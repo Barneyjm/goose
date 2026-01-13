@@ -278,7 +278,12 @@ impl Provider for OpenAiProvider {
                 // Standard API key auth (required unless using Entra ID)
                 ConfigKey::new("OPENAI_API_KEY", false, true, None),
                 ConfigKey::new("OPENAI_HOST", false, false, Some("https://api.openai.com")),
-                ConfigKey::new("OPENAI_BASE_PATH", false, false, Some("v1/chat/completions")),
+                ConfigKey::new(
+                    "OPENAI_BASE_PATH",
+                    false,
+                    false,
+                    Some("v1/chat/completions"),
+                ),
                 ConfigKey::new("OPENAI_ORGANIZATION", false, false, None),
                 ConfigKey::new("OPENAI_PROJECT", false, false, None),
                 ConfigKey::new("OPENAI_CUSTOM_HEADERS", false, true, None),
