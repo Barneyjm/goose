@@ -104,11 +104,10 @@ export default function DefaultProviderSetupForm({
 
   // Group parameters by their group field (must be before any early returns)
   const groupedParameters = useMemo(() => {
-    const groups = new Map<string | undefined, ConfigKey[]>();
+    const groups = new Map<string | undefined | null, ConfigKey[]>();
 
     parameters.forEach((p) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const groupKey = (p as any).group; // Group field not yet in generated types
+      const groupKey = p.group;
       if (!groups.has(groupKey)) {
         groups.set(groupKey, []);
       }
@@ -120,8 +119,7 @@ export default function DefaultProviderSetupForm({
 
   // Separate required fields and ungrouped optional fields (must be before any early returns)
   // Note: ungrouped params can be under either undefined or null
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const ungroupedParams = groupedParameters.get(undefined) || groupedParameters.get(null as any) || [];
+  const ungroupedParams = groupedParameters.get(undefined) || groupedParameters.get(null) || [];
   const aboveFoldParameters = ungroupedParams.filter((p) => p.required);
 
   // Determine which fields should show above the fold
