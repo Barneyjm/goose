@@ -47,7 +47,6 @@ export default function DefaultProviderSetupForm({
   );
   const [isLoading, setIsLoading] = useState(true);
   const [optionalExpanded, setOptionalExpanded] = useState(false);
-  const [groupExpandedStates, setGroupExpandedStates] = useState<Record<string, boolean>>({});
   const { read } = useConfig();
 
   const loadConfigValues = useCallback(async () => {
@@ -108,7 +107,8 @@ export default function DefaultProviderSetupForm({
     const groups = new Map<string | undefined, ConfigKey[]>();
 
     parameters.forEach((p) => {
-      const groupKey = (p as any).group; // Using 'as any' temporarily until types are regenerated
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const groupKey = (p as any).group; // Group field not yet in generated types
       if (!groups.has(groupKey)) {
         groups.set(groupKey, []);
       }
@@ -120,6 +120,7 @@ export default function DefaultProviderSetupForm({
 
   // Separate required fields and ungrouped optional fields (must be before any early returns)
   // Note: ungrouped params can be under either undefined or null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const ungroupedParams = groupedParameters.get(undefined) || groupedParameters.get(null as any) || [];
   const aboveFoldParameters = ungroupedParams.filter((p) => p.required);
 
@@ -188,13 +189,6 @@ export default function DefaultProviderSetupForm({
         <span className="text-sm font-light ml-2">({parameter.name})</span>
       </span>
     );
-  };
-
-  const toggleGroup = (groupName: string) => {
-    setGroupExpandedStates((prev) => ({
-      ...prev,
-      [groupName]: !prev[groupName],
-    }));
   };
 
   // Calculate total count of all below-fold parameters (ungrouped + grouped)
